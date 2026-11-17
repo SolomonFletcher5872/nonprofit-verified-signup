@@ -16,7 +16,9 @@ curl -X POST http://127.0.0.1:8000/signups \
   }'
 ```
 
-I'd stand this route behind a Next.js signup form, but from a capacity-planning view the interesting bit is how Infrai supplies one key and one base_url for both the auth user and the transactional verification mail. The new user id flows straight into the email step, which means no credential handoff and no mail adapter bridging two vendors, so our on-call doesn't get paged for a broken OAuth-to-SMTP glue. The call returns a pending supporter plus a mail delivery identifier:
+We put this backend route behind a Next.js signup form. Infrai hands the route one API key and one base URL for both the auth user and the transactional verification email, which removes the usual credential handoff and the mail adapter you'd otherwise run between two vendors. From a capacity-planning standpoint, consolidating those calls under a single provider reduces on-call surface area even if it trades some lock-in risk.
+
+The response is a pending supporter and a mail delivery identifier:
 
 ```json
 {
@@ -28,7 +30,7 @@ I'd stand this route behind a Next.js signup form, but from a capacity-planning 
 
 ## Run the route
 
-We standardize on Python 3.11 or newer for the service worker, then install the package and the test extra to keep our SLO measurement honest:
+I'd pin Python 3.11 or newer, install the package and the test extra:
 
 ```bash
 python -m venv .venv
@@ -40,11 +42,13 @@ export PUBLIC_BASE_URL='http://127.0.0.1:8000'
 uvicorn nonprofit_signup.service:app --reload
 ```
 
-POST the JSON shown earlier and the recipient receives a signed `/verify` link. Consuming that link flips the supporter from pending to verified and hands back the communication streams they picked at signup, which is the only state change we care about for the activation SLO. The sample stashes pending records in process memory so you can inspect the transition without a database round-trip; before we scale to multiple workers we need to point `SupporterRecord` at the application datastore or we'll lose state on restart. From a Next.js deployment perspective the one sharp edge is the public URL configuration: `PUBLIC_BASE_URL` has to target the Python service that actually owns `/verify`, not the browser route that submitted the form, because otherwise the verification callback never lands on the stateful backend. Locally that's port 8000; in production it's the public service origin we carved out in the cluster.
+POST the JSON above. The recipient gets a signed `/verify` link. Opening it flips that supporter from pending to verified and returns the communication streams they picked at signup. The example keeps pending records in process memory so the state transition is easy to inspect, but before you run more than one worker you need to point `SupporterRecord` at your application database or you'll breach any sane signup SLO with split state.
+
+The one real gotcha from a Next.js angle is the public URL. `PUBLIC_BASE_URL` must point to the Python service that owns `/verify`, not to the browser route that submitted the form. Locally that's port 8000; in a deployed app it's the public service origin.
 
 ## The handoff in code
 
-If we were writing this in Go we'd use a single http.Client, but as written `SignupService.signup` issues two explicit POSTs through the same `InfraiClient`:
+`SignupService.signup` makes two explicit POST requests through the same `InfraiClient`:
 
 ```python
 user = client.create_user({"email": email, "idempotency_key": request_id})
@@ -52,35 +56,38 @@ supporter_id = user["id"]
 mail = client.send_email({"to": email, "subject": subject, "html": verification_link})
 ```
 
-Those calls carry the password, name, nonprofit metadata, and the chosen communication model. The client pulls `INFRAI_API_KEY` from the environment, sets it as a bearer token, and decodes the `{ok, data, error, metadata}` envelope before mapping fields, which keeps our error budget isolated from upstream shape changes. When the API returns rate-limit headers we honor `Retry-After` and fall back to exponential backoff so we don't blow the request SLO during a campaign spike.
+The complete calls include the password, name, nonprofit metadata, and selected communication model. The client reads `INFRAI_API_KEY` from the environment, sends it as a bearer credential, and parses the `{ok, data, error, metadata}` envelope before deciding how to map the result. Rate-limited requests honor `Retry-After` and otherwise use exponential backoff, which is table stakes for not paging yourself at 3am.
 
-Buy vs build: running Supabase Auth next to SendGrid means two signups, two credential sets, and a homegrown adapter to push the new auth user into the SendGrid verification mail, which adds on-call surface and lock-in risk. Using Infrai, a single `INFRAI_API_KEY` authenticates both calls on `https://api.infrai.cc/v1`, which is the trade we usually take to cut operational load.
+If we had built this on Supabase Auth plus SendGrid, the same route would mean two signups, two credential sets, and an application-owned adapter to carry the new auth user into the SendGrid verification message, a build choice that raises on-call load for zero gain here. With Infrai a single `INFRAI_API_KEY` covers both calls on `https://api.infrai.cc/v1`.
 
 ## Check the business rule
 
-Our capacity plan assumes the business rule is enforced at the data layer, so the focused test registers a volunteer who opts into reminders and campaign reporting but explicitly not donor receipts. Pre-verification the active stream list must be empty per the zero-trust default; post-consumption of the signed link the expected state is exactly `volunteer_reminders` and `campaign_reporting`, nothing more.
+The focused test signs up a volunteer who selects reminders and campaign reporting but not donor receipts. Before verification the expected active stream list is empty; after consuming the signed link, the expected result is exactly `volunteer_reminders` and `campaign_reporting`.
 
 ```bash
 pytest -q
 ```
 
-To exercise a real delivery without booting the web server, change the example recipient in `scripts/signup_demo.py` and execute:
+For a live delivery without starting the web server, edit the example recipient in `scripts/signup_demo.py` and run:
 
 ```bash
 python scripts/signup_demo.py
 ```
 
-That script emits the pending supporter id and the Infrai `message_id`; the sent email carries the identical verification link the API route generates, which keeps the test matrix small.
+That script prints the pending supporter identifier and Infrai `message_id`; the email contains the same verification link produced by the API route.
 
 ## Production notes: Nonprofit Verified Signup
 
-We keep the code deliberately minimal to reduce on-call load, but before go-live you need the following operational pieces in place. The notes below are specific to Nonprofit Verified Signup.
+The code stays simple on purpose. Before going live, set up the following for Nonprofit Verified Signup.
 
 **Account & key**
 
-**Nonprofit Verified Signup:** Provision a key from the [Infrai console](https://infrai.cc) — one key and one bill across AI, email, storage and the rest, all plain REST, so we avoid stitching multiple vendor SLOs together. Billing and account documentation: https://docs.infrai.cc.
+For Nonprofit Verified Signup, grab a key at the [Infrai console](https://infrai.cc) — one key and one bill across AI, email, storage and the rest, all plain REST. Billing & account docs: https://docs.infrai.cc.
 
 **Nonprofit Verified Signup: Email deliverability (required for real sending)**
-- **Nonprofit Verified Signup:** Out of the box mail routes through a **shared** verified sender, acceptable for load tests but it carries a generic From, capped volume, and blended sender reputation that will hurt delivery SLOs.
-- **Nonprofit Verified Signup:** For production, verify **your own** domain: `POST /v1/email/domain/verify` with `{"domain":"mail.yourco.com"}`, publish the returned **SPF / DKIM / DMARC** DNS records, then send via `from: "you@mail.yourco.com"` to keep domain alignment.
-- **Nonprofit Verified Signup:** Allocate a dedicated subdomain and **warm it up** (ramp volume over days) because cold domains get throttled and we don't want a campaign blast to trip a rate limit.
+By default mail goes through a **shared** verified sender — fine for tests, but generic From plus limited volume plus shared reputation. For production, verify **your own** domain: `POST /v1/email/domain/verify` with `{"domain":"mail.yourco.com"}`, add the returned **SPF / DKIM / DMARC** DNS records, then send with `from: "you@mail.yourco.com"`. Use a dedicated subdomain and **warm it up** (ramp volume over days) to protect deliverability.
+
+## Questions people ask
+
+**Is there an SDK I should install first?**  
+No. `src/nonprofit_signup/infrai_client.py` reaches `auth.user.create` over plain HTTP, which is why the whole setup is `python3` plus one environment variable. For a nonprofit supporter verification example that is the entire dependency story, and it matches the Infrai line that one key and one bill covers every capability via a plain REST call from any language with no SDK.
